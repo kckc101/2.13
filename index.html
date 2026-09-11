@@ -551,6 +551,7 @@
       </div>
 
       <p class="party-hint" id="effectNote" hidden>Effects composite your camera only — leave the party to use one.</p>
+      <p class="party-hint" id="segStatus" hidden></p>
 
       <!-- Capture reel. One strip of circles under the live feed; the centre
            ring is the shutter. What the strip holds follows the tabs above. -->
@@ -780,6 +781,7 @@
   const partyDiag = document.getElementById('partyDiag');
   const leavePartyBtn = document.getElementById('leavePartyBtn');
   const effectNote = document.getElementById('effectNote');
+  const segStatus = document.getElementById('segStatus');
   const booth = document.querySelector('.booth');
   const cameraBar = document.getElementById('cameraBar');
   const controlsRow = document.getElementById('controlsRow');
@@ -1313,9 +1315,16 @@
       else if (video.readyState >= 2) drawCoverImage(ctx, video, fx, fy, fw, fh, mirrorPreview);
       ctx.restore();
     } else if (activeEffect === 6){
-      // Landscape 16:9 sky, person cut out and dropped in front of it.
-      const w = 1280, h = 720;
-      if (effectCanvas.width !== w){ effectCanvas.width = w; effectCanvas.height = h; }
+      /* The sky is a texture, so it crops to whatever shape the camera gives
+         us. Forcing a fixed 16:9 here meant a portrait phone sensor
+         (1920x2560 on the front camera) lost most of its frame to the crop,
+         which looked like the camera had zoomed way in. The backdrop adapts
+         to the camera now, not the other way round. */
+      const size = presentedVideoSize(1280);
+      const w = size.w, h = size.h;
+      if (effectCanvas.width !== w || effectCanvas.height !== h){
+        effectCanvas.width = w; effectCanvas.height = h;
+      }
       const ctx = effectCanvas.getContext('2d');
       if (starBgImg.complete && starBgImg.naturalWidth) drawCoverImageEl(ctx, starBgImg, 0, 0, w, h);
       else { ctx.fillStyle = '#060a18'; ctx.fillRect(0, 0, w, h); }
@@ -1434,9 +1443,9 @@
       pipsRow.hidden = true;
       shotCount.textContent = '0 / 1';
     } else if (id === 6){
-      // Starfield — a backdrop swap, so it keeps the ordinary four-frame strip
-      // and the ordinary download. Fixed 16:9 to match the sky art.
-      viewfinder.style.aspectRatio = '16 / 9';
+      // Starfield — a backdrop swap, so it keeps the ordinary four-frame strip,
+      // the ordinary download, and the camera's own full field of view.
+      applyBaseAspect();
       effectGuide.hidden = true;
       effectStrip.classList.remove('single-frame');
       normalStripWrap.hidden = false;
@@ -1688,6 +1697,17 @@
 
   let baseAspect = '4 / 3';
   function applyBaseAspect(){ viewfinder.style.aspectRatio = baseAspect; }
+
+  /* The frame shape the viewfinder is actually presenting, at pixel sizes a
+     canvas can use. Backdrop effects size themselves off this so they show the
+     same field of view the plain booth does. */
+  function presentedVideoSize(maxEdge){
+    let vw = video.videoWidth, vh = video.videoHeight;
+    if (!vw || !vh) return { w: 1280, h: 720 };
+    if (IS_MOBILE && vh > vw){ const t = vw; vw = vh; vh = t; }
+    const k = Math.min(1, maxEdge / Math.max(vw, vh));
+    return { w: Math.round(vw * k), h: Math.round(vh * k) };
+  }
   function syncViewfinderAspect(){
     if (!video.videoWidth || !video.videoHeight) return;
     let vw = video.videoWidth, vh = video.videoHeight;
@@ -1697,7 +1717,7 @@
        so the live feed is horizontal AND as wide as the camera can see. */
     if (IS_MOBILE && vh > vw){ const t = vw; vw = vh; vh = t; }
     baseAspect = vw + ' / ' + vh;
-    const overridden = (activeEffect === 4 || activeEffect === 5 || activeEffect === 6) || (partyMode && partyBgFrame());
+    const overridden = (activeEffect === 4 || activeEffect === 5) || (partyMode && partyBgFrame());
     if (!overridden) applyBaseAspect();
   }
 
@@ -1746,6 +1766,19 @@
       if (normal) return normal.deviceId;
     }
     return pool[0].deviceId;
+  }
+
+  function trackGoesWider(track){
+    try {
+      const caps = track.getCapabilities && track.getCapabilities();
+      return !!(caps && caps.zoom && typeof caps.zoom.min === 'number' && caps.zoom.min < 1);
+    } catch (e) { return false; }
+  }
+
+  function deviceIsWide(deviceId){
+    if (!deviceId) return false;
+    const d = videoDevices.find(v => v.deviceId === deviceId);
+    return !!(d && d.label && RE_WIDE.test(d.label));
   }
 
   async function applyZoomFactor(track, factor){
@@ -1816,6 +1849,16 @@
 
     currentFacing = facing;
     currentZoom = zoom;
+    /* Most front cameras have no second, wider module and no sub-1 zoom range,
+       so 0.5x silently did nothing while the chip stayed lit. Say so instead. */
+    if (zoom <= 0.5 && !deviceIsWide(deviceId) && !trackGoesWider(track)){
+      currentZoom = 1;
+      const wideChip = zoomGroup.querySelector('.cam-chip[data-zoom="0.5"]');
+      if (wideChip){
+        wideChip.disabled = true;
+        wideChip.title = 'This camera has no wider lens';
+      }
+    }
     setMirror(facing !== 'environment');
     refreshFilterPreviews();
     localCutAt = 0;
@@ -1838,14 +1881,16 @@
     try {
       await openCamera(facing, zoom);
       markActive(facingGroup, 'facing', facing);
-      markActive(zoomGroup, 'zoom', zoom);
+      markActive(zoomGroup, 'zoom', currentZoom);   // openCamera may refuse 0.5x
     } catch (e) {
       // put the buttons back where they were if the device refused
       markActive(facingGroup, 'facing', prevFacing);
       markActive(zoomGroup, 'zoom', prevZoom);
     }
     facingGroup.querySelectorAll('.cam-chip').forEach(c => c.disabled = false);
-    zoomGroup.querySelectorAll('.cam-chip').forEach(c => c.disabled = false);
+    zoomGroup.querySelectorAll('.cam-chip').forEach(c => {
+      if (!c.title) c.disabled = false;   // leave a lens we know isn't there disabled
+    });
   }
 
   facingGroup.addEventListener('click', (e) => {
@@ -1910,6 +1955,7 @@
     controlsRow.classList.add('live');
     captureBtn.disabled = false;
     reel.hidden = false;
+    warmSegmenter();
     syncReel();
     refreshFilterPreviews();
     return stream;
@@ -2195,6 +2241,22 @@
     partyDiag.classList.toggle('ok', remoteFrameReady());
   }, 900);
 
+  /* Without this the only symptom of a model that hasn't downloaded yet is an
+     effect that appears to do nothing at all. */
+  setInterval(() => {
+    if (!segStatus) return;
+    const needsCutout = (activeEffect === 4 || activeEffect === 6) || (partyMode && aiCutout);
+    if (!needsCutout){ segStatus.hidden = true; return; }
+    if (segFailed){
+      segStatus.hidden = false;
+      segStatus.textContent = "AI cutout couldn't load on this device. Check your connection and reload — effects need it.";
+      return;
+    }
+    const ready = (activeEffect > 0) ? effectCutFresh() : localCutFresh();
+    segStatus.hidden = ready;
+    if (!ready) segStatus.textContent = 'Loading AI cutout… first use downloads the model, give it a few seconds.';
+  }, 700);
+
   function sendPartyMsg(msg){
     if (partyConn && partyConn.open) {
       try { partyConn.send(msg); } catch (e) { /* peer went away */ }
@@ -2472,6 +2534,10 @@
   let segTarget = null;
   let segBusy = false;
   let segFailed = false;
+  let segStalls = 0;
+  /* MediaPipe's first send() on a phone has to fetch and compile the WASM
+     model, which is slow on mobile data — but it must not hang forever. */
+  const SEG_TIMEOUT_MS = 12000;
 
   function ensureSegmenter(){
     if (sharedSeg || segFailed) return sharedSeg;
@@ -2493,9 +2559,32 @@
     if (!seg || !source) return;
     segBusy = true;
     segTarget = handler;
-    try { await seg.send({ image: source }); } catch (e) { /* frame skipped */ }
+    try {
+      /* A send() that never settles used to leave segBusy stuck true, which
+         silently killed every cutout on the page for the rest of the session —
+         the effect just showed the raw camera and never said why. */
+      await Promise.race([
+        seg.send({ image: source }),
+        new Promise((_, reject) => setTimeout(() => reject(new Error('segmentation timed out')), SEG_TIMEOUT_MS))
+      ]);
+      segStalls = 0;
+    } catch (e) {
+      if (++segStalls >= 4) segFailed = true;
+    }
     segTarget = null;
     segBusy = false;
+  }
+
+  /* Warm the model up as soon as the camera is live, so picking an effect
+     doesn't start a cold multi-second download while you stare at a raw feed. */
+  let segWarmed = false;
+  function warmSegmenter(){
+    if (segWarmed || segFailed) return;
+    segWarmed = true;
+    setTimeout(() => {
+      if (!video.videoWidth) { segWarmed = false; return; }
+      segmentInto(function warmUp(){}, scaleEffectSeg(video));
+    }, 600);
   }
 
   function onLocalSegResult(results){
